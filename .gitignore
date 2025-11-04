@@ -1,1 +1,29 @@
-directory_paths.txt
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Environments
+venv/
+.env
+env/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Outputs
+outputs*/
+*.log
+
+# Streamlit
+.streamlit/

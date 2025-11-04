@@ -1,88 +1,121 @@
-import streamlit as st
-import pandas as pd
-import os
-import tempfile
-from pathlib import Path
-import re
+import io
+from zipfile import ZipFile
 
-st.set_page_config(page_title="Amex Expense Tool", layout="centered")
+import pandas as pd
+import streamlit as st
+
+from amex_tool.pipeline import (
+    apply_corporate_cards,
+    clean_statement,
+    generate_claim_frames,
+    load_corporate_mapping,
+    load_statement,
+    load_template_columns,
+    GROUP_COLUMN,
+)
+
+st.set_page_config(page_title="AMEX Expense Claim Generator", layout="wide")
 st.title("💳 AMEX Expense Claim Generator")
 
-# File upload
-uploaded_statement = st.file_uploader("Upload AMEX Excel or CSV File:", type=["xlsx", "xls", "csv"])
+st.markdown(
+    "Upload the monthly AMEX statement along with an optional template and corporate "
+    "card mapping file. The app will generate one claim workbook per cardholder."
+)
 
-amount_column = "Transaction \nAmount \nUSD"
-last_name_column = "Supplemental \nCardmember Last \nName"
+with st.form("processor"):
+    uploaded_statement = st.file_uploader(
+        "AMEX Statement (.csv, .xls, .xlsx)", type=["csv", "xls", "xlsx"]
+    )
+    uploaded_template = st.file_uploader(
+        "Output Template (optional, .csv, .xls, .xlsx)", type=["csv", "xls", "xlsx"]
+    )
+    uploaded_corporate = st.file_uploader(
+        "Corporate Card Mapping (optional, .csv, .xls, .xlsx)",
+        type=["csv", "xls", "xlsx"],
+    )
+    export_format = st.selectbox("Export format", ["excel", "csv"])
+    submitted = st.form_submit_button("Generate Claim Files")
 
-# Template
-uploaded_template = st.file_uploader("Upload Template File (Excel):", type=["xlsx"])
+if submitted:
+    if not uploaded_statement:
+        st.error("Please upload an AMEX statement file.")
+    else:
+        try:
+            statement_df = load_statement(uploaded_statement, uploaded_statement.name)
+            cleaned_df = clean_statement(statement_df)
 
-# Optional corporate card file
-uploaded_corp_card = st.file_uploader("Upload Employee Corporate Card File (Optional):", type=["xlsx"])
+            template_columns = (
+                load_template_columns(uploaded_template, uploaded_template.name)
+                if uploaded_template
+                else None
+            )
 
-export_format = st.selectbox("Choose export format:", ["excel", "csv"])
+            claims = generate_claim_frames(cleaned_df, template_columns)
 
-if uploaded_statement and uploaded_template:
-    try:
-        # Read statement
-        if uploaded_statement.name.endswith("csv"):
-            df = pd.read_csv(uploaded_statement)
-        else:
-            df = pd.read_excel(uploaded_statement)
-
-        df.columns = df.iloc[13]  # Use row 14 as header
-        df = df.iloc[14:].reset_index(drop=True)
-
-        # Clean amount column
-        if amount_column in df.columns:
-            df[amount_column] = df[amount_column].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False)
-            df[amount_column] = pd.to_numeric(df[amount_column], errors='coerce')
-            df = df[df[amount_column] >= 0]
-
-        # Remove numbers from Description 4
-        df['Transaction \nDescription 4'] = df['Transaction \nDescription 4'].apply(
-            lambda x: re.sub(r'\d+', '', x) if isinstance(x, str) else x
-        )
-
-        # Load template
-        template_df = pd.read_excel(uploaded_template)
-        template_columns = template_df.columns.tolist()
-
-        unique_names = df[last_name_column].dropna().unique()
-
-        zip_buffer = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        output_files = []
-
-        for name in unique_names:
-            emp_data = df[df[last_name_column] == name]
-            emp_template = pd.DataFrame(columns=template_columns)
-
-            for _, row in emp_data.iterrows():
-                new_row = {col: "" for col in emp_template.columns}
-                new_row["Date"] = row.get("Transaction Date", "")
-                new_row["Ref. Nbr."] = row.get("Transaction \nDescription 4", "")
-                new_row["Description"] = row.get("Transaction \nDescription 1", "")
-                new_row["Amount"] = row.get(amount_column, "")
-                new_row["Claim Amount"] = row.get(amount_column, "")
-                new_row["Paid With"] = "Corporate Card, Company Expense"
-                new_row["Branch"] = "KEC"
-                emp_template = pd.concat([emp_template, pd.DataFrame([new_row])], ignore_index=True)
-
-            out_filename = f"{name}_AMEX_Claim.{ 'xlsx' if export_format == 'excel' else 'csv' }"
-            out_path = os.path.join(tempfile.gettempdir(), out_filename)
-
-            if export_format == "excel":
-                emp_template.to_excel(out_path, index=False)
+            if not claims:
+                st.warning(
+                    f"No cardholder rows found. Ensure '{GROUP_COLUMN}' is populated."
+                )
             else:
-                emp_template.to_csv(out_path, index=False)
+                mapping = (
+                    load_corporate_mapping(
+                        uploaded_corporate, uploaded_corporate.name
+                    )
+                    if uploaded_corporate
+                    else None
+                )
+                claims = apply_corporate_cards(claims, mapping)
 
-            with open(out_path, "rb") as f:
-                st.download_button(f"Download {name}'s File", f, file_name=out_filename)
+                summary_rows = []
+                for last_name, frame in claims.items():
+                    totals = pd.to_numeric(
+                        frame.get("Amount", pd.Series(dtype=float)), errors="coerce"
+                    ).fillna(0)
+                    summary_rows.append(
+                        {
+                            "Last Name": last_name,
+                            "Rows": len(frame),
+                            "Total Amount": float(totals.sum()),
+                            "Corporate Card": (
+                                frame["Corporate Card"].iloc[0]
+                                if "Corporate Card" in frame.columns
+                                and not frame["Corporate Card"].empty
+                                else ""
+                            ),
+                        }
+                    )
 
-        st.success("✅ All files processed and ready for download.")
+                summary = pd.DataFrame(summary_rows).sort_values("Last Name")
+                st.success(f"Generated {len(claims)} claim files.")
+                st.dataframe(summary, use_container_width=True)
 
-    except Exception as e:
-        st.error(f"Error processing files: {e}")
+                zip_buffer = io.BytesIO()
+                with ZipFile(zip_buffer, "w") as zip_file:
+                    for last_name, frame in claims.items():
+                        file_name = (
+                            f"{last_name}_AMEX_Claim.xlsx"
+                            if export_format == "excel"
+                            else f"{last_name}_AMEX_Claim.csv"
+                        )
+                        if export_format == "excel":
+                            excel_bytes = io.BytesIO()
+                            frame.to_excel(excel_bytes, index=False)
+                            zip_file.writestr(file_name, excel_bytes.getvalue())
+                        else:
+                            csv_bytes = frame.to_csv(index=False).encode("utf-8")
+                            zip_file.writestr(file_name, csv_bytes)
+                zip_buffer.seek(0)
 
-else:
-    st.info("Please upload both the AMEX statement and the template file.")
+                st.download_button(
+                    "⬇️ Download All Claim Files (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="amex_claims.zip",
+                    mime="application/zip",
+                )
+
+                with st.expander("Preview first claim file"):
+                    first_name, first_frame = next(iter(claims.items()))
+                    st.write(f"{first_name}_AMEX_Claim")
+                    st.dataframe(first_frame.head(), use_container_width=True)
+        except Exception as exc:
+            st.error(f"Processing failed: {exc}")
