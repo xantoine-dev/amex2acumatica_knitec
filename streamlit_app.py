@@ -6,7 +6,9 @@ import streamlit as st
 
 from amex_tool.pipeline import (
     apply_corporate_cards,
+    claim_file_name,
     clean_statement,
+    corporate_card_match_summary,
     generate_claim_frames,
     load_corporate_mapping,
     load_statement,
@@ -64,7 +66,14 @@ if submitted:
                     if uploaded_corporate
                     else None
                 )
+                card_summary = corporate_card_match_summary(claims, mapping)
                 claims = apply_corporate_cards(claims, mapping)
+                if card_summary["unmatched"]:
+                    st.warning(
+                        f"{card_summary['unmatched']} cardholder(s) were not matched "
+                        "to corporate cards. Corporate Card was left blank for those "
+                        "claim files."
+                    )
 
                 summary_rows = []
                 for last_name, frame in claims.items():
@@ -92,11 +101,7 @@ if submitted:
                 zip_buffer = io.BytesIO()
                 with ZipFile(zip_buffer, "w") as zip_file:
                     for last_name, frame in claims.items():
-                        file_name = (
-                            f"{last_name}_AMEX_Claim.xlsx"
-                            if export_format == "excel"
-                            else f"{last_name}_AMEX_Claim.csv"
-                        )
+                        file_name = claim_file_name(last_name, export_format)
                         if export_format == "excel":
                             excel_bytes = io.BytesIO()
                             frame.to_excel(excel_bytes, index=False)

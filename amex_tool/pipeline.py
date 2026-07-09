@@ -3,7 +3,7 @@ import logging
 import re
 from collections import OrderedDict
 from pathlib import Path
-from typing import Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -33,6 +33,20 @@ GROUP_COLUMN = "Supplemental Cardmember Last Name"
 TRANSACTION_DATE_COLUMN = "Transaction Date"
 DESCRIPTION_SOURCE_COLUMN = "Transaction Description 1"
 
+NAME_COLUMN_CANDIDATES = [
+    "Name",
+    "Employee Name",
+    "Cardholder Name",
+    "Cardholder",
+    "Employee",
+]
+CARD_VALUE_COLUMN_CANDIDATES = [
+    "Corporate Card ID",
+    "Corporate Card",
+    "Card ID",
+    "Card Number",
+]
+
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -52,6 +66,41 @@ def _stringify_cell(value) -> str:
     if re.fullmatch(r"-?\d+\.0", text):
         return text[:-2]
     return text
+
+
+def _column_key(column: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(column).lower())
+
+
+def _find_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    keyed = {_column_key(column): column for column in df.columns}
+    for candidate in candidates:
+        column = keyed.get(_column_key(candidate))
+        if column is not None:
+            return column
+    return None
+
+
+def _read_csv(handle: RawFile, **kwargs) -> pd.DataFrame:
+    if hasattr(handle, "seek"):
+        handle.seek(0)
+    return pd.read_csv(
+        handle,
+        sep=None,
+        engine="python",
+        encoding="utf-8-sig",
+        dtype=str,
+        **kwargs,
+    )
+
+
+def claim_file_name(name: str, export_format: str = "excel") -> str:
+    text = str(name).replace("\\", "/").split("/")[-1]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    if not stem:
+        stem = "cardholder"
+    suffix = ".xlsx" if export_format == "excel" else ".csv"
+    return f"{stem}_AMEX_Claim{suffix}"
 
 
 def _open_file(file: RawFile) -> Tuple[RawFile, Optional[str]]:
@@ -86,7 +135,7 @@ def load_statement(file: RawFile, file_name: Optional[str] = None) -> pd.DataFra
 
 def _read_raw_table(handle: RawFile, suffix: str) -> pd.DataFrame:
     if suffix == ".csv":
-        return pd.read_csv(handle, header=None, dtype=str)
+        return _read_csv(handle, header=None)
     if suffix == ".xlsx":
         return pd.read_excel(handle, engine="openpyxl", header=None)
     if suffix == ".xls":
@@ -140,22 +189,17 @@ def clean_statement(
                 f"Available columns: {list(df.columns)}"
             )
     cleaned = df.copy()
-    cleaned[amount_column] = (
+    cleaned.loc[:, amount_column] = (
         cleaned[amount_column]
         .astype(str)
         .str.replace("$", "", regex=False)
         .str.replace(",", "", regex=False)
     )
-    cleaned[amount_column] = pd.to_numeric(cleaned[amount_column], errors="coerce")
+    cleaned.loc[:, amount_column] = pd.to_numeric(
+        cleaned[amount_column], errors="coerce"
+    )
     cleaned = cleaned[cleaned[amount_column].notna()]
     cleaned = cleaned[cleaned[amount_column] >= 0]
-
-    if description_column in cleaned.columns:
-        cleaned[description_column] = (
-            cleaned[description_column]
-            .astype(str)
-            .apply(lambda val: re.sub(r"\d+", "", val))
-        )
 
     logger.info(
         "Statement cleaned: %s rows remain after amount filtering.", len(cleaned)
@@ -181,7 +225,7 @@ def load_template_columns(file: RawFile, file_name: Optional[str] = None) -> Lis
                 "Install it with 'pip install xlrd'."
             ) from exc
     elif suffix == ".csv":
-        df = pd.read_csv(handle, nrows=0)
+        df = _read_csv(handle, nrows=0)
     else:
         raise ValueError(f"Unsupported template file type: {suffix}")
 
@@ -212,16 +256,16 @@ def generate_claim_frames(
     frames: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
     grouped = df.groupby(group_column, dropna=True)
     for name, group in grouped:
-        output = base_template.copy()
-        output["Date"] = group.get(date_column, "")
-        output["Ref. Nbr."] = group.get(reference_column, "")
-        output["Description"] = group.get(description_column, "")
-        output["Amount"] = group.get(amount_column, 0)
-        output["Claim Amount"] = group.get(amount_column, 0)
+        output = pd.DataFrame(index=group.index, columns=base_template.columns)
+        output.loc[:, "Date"] = group.get(date_column, "")
+        output.loc[:, "Ref. Nbr."] = group.get(reference_column, "")
+        output.loc[:, "Description"] = group.get(description_column, "")
+        output.loc[:, "Amount"] = group.get(amount_column, 0)
+        output.loc[:, "Claim Amount"] = group.get(amount_column, 0)
         if "Paid With" in output.columns:
-            output["Paid With"] = "Corporate Card, Company Expense"
+            output.loc[:, "Paid With"] = "Corporate Card, Company Expense"
         if "Branch" in output.columns and output["Branch"].isna().all():
-            output["Branch"] = "KEC"
+            output.loc[:, "Branch"] = "KEC"
         frames[str(name)] = output.reset_index(drop=True)
     logger.info("Generated %s claim frames.", len(frames))
     return frames
@@ -235,7 +279,7 @@ def load_corporate_mapping(file: RawFile, file_name: Optional[str] = None) -> pd
         raise ValueError("Cannot determine file type for corporate mapping.")
 
     if suffix == ".csv":
-        df = pd.read_csv(handle, dtype=str)
+        df = _read_csv(handle)
     elif suffix == ".xlsx":
         df = pd.read_excel(handle, engine="openpyxl")
     elif suffix == ".xls":
@@ -254,32 +298,66 @@ def load_corporate_mapping(file: RawFile, file_name: Optional[str] = None) -> pd
         raise ValueError("Corporate card file must contain at least two columns.")
     df = df.copy()
     for column in df.columns:
-        df[column] = df[column].map(_stringify_cell)
-    df["Combined"] = df.iloc[:, 0].astype(str) + " - " + df.iloc[:, 1].astype(str)
-    df["Last Name"] = df["Combined"].str.split().str[-1].str.lower()
+        df.loc[:, column] = df[column].map(_stringify_cell)
+
+    name_column = _find_column(df, NAME_COLUMN_CANDIDATES)
+    card_value_column = _find_column(df, CARD_VALUE_COLUMN_CANDIDATES)
+    if name_column is None:
+        name_column = df.columns[1] if df.shape[1] > 1 else df.columns[0]
+    if card_value_column is None:
+        card_value_column = df.columns[0]
+
+    names = df[name_column].astype(str).map(_stringify_cell)
+    card_values = df[card_value_column].astype(str).map(_stringify_cell)
+    df.loc[:, "Combined"] = [
+        f"{card} - {name}" if card and name else card or name
+        for card, name in zip(card_values, names)
+    ]
+    df.loc[:, "Last Name"] = (
+        names.str.split().str[-1].fillna("").astype(str).str.strip().str.lower()
+    )
+    df.attrs["name_column"] = name_column
+    df.attrs["card_value_column"] = card_value_column
     return df[["Combined", "Last Name"]]
+
+
+def _corporate_lookup(mapping: Optional[pd.DataFrame]) -> Dict[str, str]:
+    if mapping is None:
+        return {}
+    usable = mapping.dropna(subset=["Last Name", "Combined"]).copy()
+    usable.loc[:, "Last Name"] = usable["Last Name"].astype(str).str.strip()
+    usable = usable[usable["Last Name"] != ""]
+    return usable.drop_duplicates("Last Name").set_index("Last Name")["Combined"].to_dict()
+
+
+def corporate_card_match_summary(
+    frames: Mapping[str, pd.DataFrame],
+    mapping: Optional[pd.DataFrame],
+) -> Dict[str, Union[int, List[str]]]:
+    lookup = _corporate_lookup(mapping)
+    cardholders = [str(key).strip().lower() for key in frames.keys()]
+    unmatched = [key for key in cardholders if key and key not in lookup]
+    matched = [key for key in cardholders if key and key in lookup]
+    return {
+        "cardholders": len(cardholders),
+        "matched": len(matched),
+        "unmatched": len(unmatched),
+        "unmatched_cardholders": unmatched,
+    }
 
 
 def apply_corporate_cards(
     frames: MutableMapping[str, pd.DataFrame],
     mapping: Optional[pd.DataFrame],
 ) -> MutableMapping[str, pd.DataFrame]:
-    if mapping is None:
-        for key, frame in frames.items():
-            if "Corporate Card" in frame.columns:
-                frame["Corporate Card"] = "Not Assigned"
-        return frames
-
-    lookup = (
-        mapping.dropna(subset=["Last Name", "Combined"])
-        .drop_duplicates("Last Name")
-        .set_index("Last Name")["Combined"]
-    )
+    lookup = _corporate_lookup(mapping)
     for key, frame in frames.items():
         lname = str(key).strip().lower()
-        value = lookup.get(lname, "Not Assigned")
+        value = lookup.get(lname, "")
         if "Corporate Card" in frame.columns:
-            frame["Corporate Card"] = value
+            frame.loc[:, "Corporate Card"] = value
+        if not value:
+            logger.warning("No corporate card match found for one cardholder.")
     return frames
 
 
@@ -292,8 +370,7 @@ def save_claim_frames(
     path.mkdir(parents=True, exist_ok=True)
     exported: List[Path] = []
     for name, frame in frames.items():
-        suffix = ".xlsx" if export_format == "excel" else ".csv"
-        out_path = path / f"{name}_AMEX_Claim{suffix}"
+        out_path = path / claim_file_name(str(name), export_format)
         if export_format == "excel":
             frame.to_excel(out_path, index=False)
         else:

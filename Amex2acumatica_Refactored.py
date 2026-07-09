@@ -4,6 +4,7 @@ from typing import Optional
 from amex_tool.pipeline import (
     apply_corporate_cards,
     clean_statement,
+    corporate_card_match_summary,
     generate_claim_frames,
     load_corporate_mapping,
     load_statement,
@@ -35,7 +36,14 @@ def main(
     claim_frames = generate_claim_frames(cleaned_df, template_columns)
 
     mapping = load_corporate_mapping(corporate_file) if corporate_file else None
+    card_summary = corporate_card_match_summary(claim_frames, mapping)
     claim_frames = apply_corporate_cards(claim_frames, mapping)
+    if card_summary["unmatched"]:
+        logging.warning(
+            "%s cardholder(s) were not matched to corporate cards. "
+            "Corporate Card was left blank for those claim files.",
+            card_summary["unmatched"],
+        )
 
     exported = save_claim_frames(claim_frames, output_dir, export_format)
     logging.info("✅ Processing complete. Generated %s files.", len(exported))
