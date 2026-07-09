@@ -16,7 +16,10 @@ from amex_tool.pipeline import (
     GROUP_COLUMN,
 )
 
+APP_VERSION = "cff90c0 - corporate card import fix"
+
 st.set_page_config(page_title="AMEX Expense Claim Generator", layout="wide")
+st.sidebar.caption(f"Version: {APP_VERSION}")
 st.title("💳 AMEX Expense Claim Generator")
 
 st.markdown(
