@@ -44,6 +44,8 @@ A streamlined toolchain that converts American Express billing statements into p
    - `--template` can be added to control column order.
 
 ## Input Data
+If distinct claim names produce the same sanitized filename (including case-only differences), the entire export batch is rejected; correct the input names and retry.
+
 Sample datasets were removed from version control for confidentiality. Provide your own AMEX statement exports and optional corporate card mapping files when running the CLI or Streamlit app. If you need reusable fixtures, create synthetic data locally and keep it outside tracked Git history.
 
 ## Under The Hood

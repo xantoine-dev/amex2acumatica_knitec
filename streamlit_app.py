@@ -1,12 +1,9 @@
-import io
-from zipfile import ZipFile
-
 import pandas as pd
 import streamlit as st
 
 from amex_tool.pipeline import (
     apply_corporate_cards,
-    claim_file_name,
+    build_claim_zip,
     clean_statement,
     corporate_card_match_summary,
     generate_claim_frames,
@@ -98,25 +95,13 @@ if submitted:
                     )
 
                 summary = pd.DataFrame(summary_rows).sort_values("Last Name")
+                zip_bytes = build_claim_zip(claims, export_format)
                 st.success(f"Generated {len(claims)} claim files.")
                 st.dataframe(summary, use_container_width=True)
 
-                zip_buffer = io.BytesIO()
-                with ZipFile(zip_buffer, "w") as zip_file:
-                    for last_name, frame in claims.items():
-                        file_name = claim_file_name(last_name, export_format)
-                        if export_format == "excel":
-                            excel_bytes = io.BytesIO()
-                            frame.to_excel(excel_bytes, index=False)
-                            zip_file.writestr(file_name, excel_bytes.getvalue())
-                        else:
-                            csv_bytes = frame.to_csv(index=False).encode("utf-8")
-                            zip_file.writestr(file_name, csv_bytes)
-                zip_buffer.seek(0)
-
                 st.download_button(
                     "⬇️ Download All Claim Files (ZIP)",
-                    data=zip_buffer.getvalue(),
+                    data=zip_bytes,
                     file_name="amex_claims.zip",
                     mime="application/zip",
                 )

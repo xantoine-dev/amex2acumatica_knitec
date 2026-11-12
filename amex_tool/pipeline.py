@@ -4,6 +4,7 @@ import re
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from zipfile import ZipFile
 
 import pandas as pd
 
@@ -101,6 +102,26 @@ def claim_file_name(name: str, export_format: str = "excel") -> str:
         stem = "cardholder"
     suffix = ".xlsx" if export_format == "excel" else ".csv"
     return f"{stem}_AMEX_Claim{suffix}"
+
+
+def plan_claim_file_names(
+    frames: Mapping[str, pd.DataFrame], export_format: str = "excel"
+) -> Dict[str, str]:
+    """Validate all batch filenames before any export side effects."""
+    planned: Dict[str, str] = {}
+    seen: Dict[str, str] = {}
+    for name in frames:
+        file_name = claim_file_name(name, export_format)
+        identity = file_name.casefold()
+        if identity in seen:
+            raise ValueError(
+                f"Distinct claim names {seen[identity]!r} and {name!r} generate "
+                f"the same output filename (case-insensitive): {file_name!r}. "
+                "Correct the input names and retry."
+            )
+        seen[identity] = name
+        planned[name] = file_name
+    return planned
 
 
 def _open_file(file: RawFile) -> Tuple[RawFile, Optional[str]]:
@@ -366,11 +387,12 @@ def save_claim_frames(
     output_dir: Union[str, Path],
     export_format: str = "excel",
 ) -> List[Path]:
+    file_names = plan_claim_file_names(frames, export_format)
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
     exported: List[Path] = []
     for name, frame in frames.items():
-        out_path = path / claim_file_name(str(name), export_format)
+        out_path = path / file_names[name]
         if export_format == "excel":
             frame.to_excel(out_path, index=False)
         else:
@@ -378,3 +400,21 @@ def save_claim_frames(
         exported.append(out_path)
         logger.info("Wrote %s rows for %s → %s", len(frame), name, out_path)
     return exported
+
+
+def build_claim_zip(
+    frames: Mapping[str, pd.DataFrame], export_format: str = "excel"
+) -> bytes:
+    """Build an in-memory archive after validating the entire batch."""
+    file_names = plan_claim_file_names(frames, export_format)
+    zip_buffer = io.BytesIO()
+    with ZipFile(zip_buffer, "w") as zip_file:
+        for name, frame in frames.items():
+            if export_format == "excel":
+                excel_bytes = io.BytesIO()
+                frame.to_excel(excel_bytes, index=False)
+                contents = excel_bytes.getvalue()
+            else:
+                contents = frame.to_csv(index=False).encode("utf-8")
+            zip_file.writestr(file_names[name], contents)
+    return zip_buffer.getvalue()
